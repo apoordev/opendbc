@@ -45,7 +45,7 @@ class CarInterface(CarInterfaceBase):
     # hands-off and below 45 kph. That is a property of the EPS, not of the car, so a car with
     # the 2022+ EPS swapped in is controllable and lifts with it. Longitudinal stays keyed on the
     # model above: the radar and camera are not part of an EPS swap.
-    ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021) and not steer_to_zero
+    ret.dashcamOnly = candidate not in (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX9_2021, CAR.MAZDA_6) and not steer_to_zero
 
     ret.enableBsm = 0x477 in fingerprint[0]
 
