@@ -123,7 +123,7 @@ class CAR(Platforms):
     MazdaCarSpecs(mass=2875 * CV.LB_TO_KG, wheelbase=2.7, steerRatio=14.0)
   )
   MAZDA_6 = MazdaPlatformConfig(
-    [MazdaCarDocs("Mazda 6 2017-20")],
+    [MazdaCarDocs("Mazda 6 2017-21")],
     MazdaCarSpecs(mass=3443 * CV.LB_TO_KG, wheelbase=2.83, steerRatio=15.5)
   )
   MAZDA_CX9_2021 = MazdaPlatformConfig(
