@@ -26,7 +26,13 @@
 
 #define MAZDA_PARAM_LONGITUDINAL 1U
 
+// CRZ_BTNS frames (10 Hz) an engage press stays fresh. Every logged engagement shows the
+// press 30-70 ms before PEDALS.ACC_ACTIVE rises (104-engagement census, zero genuine
+// button-less engagements), so 1 s is generous.
+#define MAZDA_ENGAGE_BTN_WINDOW 10U
+
 static bool mazda_longitudinal = false;
+static uint32_t mazda_engage_btn_frames = 0U;
 
 // With longitudinal control the stock radar is silenced and openpilot replays its frames,
 // so allowed tx patterns are pinned to byte-exact stock captures wherever possible.
@@ -80,8 +86,12 @@ static bool mazda_synthetic_lead_radar_track_msg_valid(const CANPacket_t *msg) {
 }
 
 static bool mazda_radar_track_msg_valid(const CANPacket_t *msg) {
+  // The occupied slot is perception data, not actuation: a stock radar reports its objects
+  // ignition to ignition, engaged or not, and the controller mirrors that. Gating it on
+  // controls_allowed silently killed 0x364 at every disengagement while CRZ_CTRL still said
+  // has_lead=1, the exact track/ctrl disagreement the camera faults on.
   return mazda_empty_radar_track_msg_valid(msg) ||
-         (controls_allowed && mazda_synthetic_lead_radar_track_msg_valid(msg));
+         mazda_synthetic_lead_radar_track_msg_valid(msg);
 }
 
 // track msgs coming from OP so that we know what CAM msgs to drop and what to forward
@@ -112,6 +122,12 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
       if (cancel) {
         controls_allowed = false;
       }
+      // RES, SET_P or SET_M: the driver-intent half of the engagement qualifier below
+      if (GET_BIT(msg, 2U) || GET_BIT(msg, 4U) || GET_BIT(msg, 5U)) {
+        mazda_engage_btn_frames = MAZDA_ENGAGE_BTN_WINDOW;
+      } else if (mazda_engage_btn_frames > 0U) {
+        mazda_engage_btn_frames -= 1U;
+      }
     }
 
     if (msg->addr == MAZDA_ENGINE_DATA) {
@@ -130,7 +146,17 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
 
         if (acc_armed || cruise_engaged_prev || (!brake && !brake_pressed_prev)) {
           acc_main_on = acc_armed;
-          pcm_cruise_check(cruise_engaged);
+          // Arm only on an engaged rising edge backed by a recent SET/RES press, the
+          // hyundai_common form: ACC_ACTIVE alone is the body answering frames we fabricate.
+          // The tx hooks already drop engaged-claiming frames while controls are not
+          // allowed, so this is defense in depth, not the only gate.
+          if (cruise_engaged && !cruise_engaged_prev && (mazda_engage_btn_frames > 0U)) {
+            controls_allowed = true;
+          }
+          if (!cruise_engaged) {
+            controls_allowed = false;
+          }
+          cruise_engaged_prev = cruise_engaged;
         }
       }
       brake_pressed = brake;
@@ -176,17 +202,31 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   }
 
   if (mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
-    // the stock standby pattern pegs the command field high; allow it byte-exactly
-    // (checksum included) instead of decoding it as a huge accel command
+    // the stock patterns for a radar that is not controlling peg the command field high:
+    // main-off standby (data[4]=0xc0, data[5]=0x00) and armed-idle (bit 47 set, and
+    // ACC_SET_ALLOWED mirroring the brake) both carry raw 8190. Allow them byte-exactly
+    // (checksum included) instead of decoding them as a huge accel command; ACC_ACTIVE
+    // (data[4] bit 1) stays required-low here, so no engaged frame can ride this allowance
     bool stock_standby = (msg->data[0] == 0x01U) && (msg->data[1] == 0xffU) &&
                          (msg->data[2] == 0xe3U) && (msg->data[3] == 0xffU) &&
-                         (msg->data[4] == 0xc0U) && (msg->data[5] == 0x00U) &&
+                         ((msg->data[4] & 0xfbU) == 0xc0U) &&
+                         ((msg->data[5] & 0x7fU) == 0x00U) &&
                          ((msg->data[6] & 0xf0U) == 0x00U) &&
-                         (msg->data[7] == ((0x5dU - msg->data[6]) & 0xffU));
+                         (msg->data[7] == ((0xffU - ((msg->data[0] + msg->data[1] + msg->data[2] + msg->data[3] +
+                                                     msg->data[4] + msg->data[5] + msg->data[6]) & 0xffU)) & 0xffU));
 
     // 13-bit ACCEL_CMD: data[2] low bits, data[3], data[4] high bits, offset 4096
     int desired_accel = ((((int)msg->data[2] & 0x3) << 11) | (((int)msg->data[3]) << 3) | (((int)msg->data[4]) >> 5)) - 4096;
     if (!stock_standby && longitudinal_accel_checks(desired_accel, MAZDA_LONG_LIMITS)) {
+      tx = false;
+    }
+
+    // ACC_ACTIVE (bit 33) mirrors CRZ_CTRL's CRZ_ACTIVE gate: an engaged-claiming accel
+    // frame must not flow while controls are not allowed. No deadlock: the body raises
+    // PEDALS.ACC_ACTIVE off the SET press 10-20 ms before the first ACC_ACTIVE=1 frame
+    // in every logged engagement, so controls_allowed leads this bit, not the reverse.
+    bool acc_active = GET_BIT(msg, 33U);
+    if (!controls_allowed && acc_active) {
       tx = false;
     }
   }
@@ -234,12 +274,20 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
 }
 
 static safety_config mazda_init(uint16_t param) {
+  mazda_engage_btn_frames = 0U;
+
   static const CanMsg MAZDA_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
     {MAZDA_LKAS_HUD, 0, 8, .check_relay = true},
   };
 
+  // The replaced-radar addresses stay check_relay = false on purpose: that mechanism is for
+  // harness-blocked ECUs that are silent from ignition on, and any RX after 1 s latches a
+  // permanent relay_malfunction. This radar is software-silenced mid-session -- alive for the
+  // first ~10 s by design, and deliberately overlapped during the ordered hand-back -- so the
+  // relay check would fault every boot. The two-master guard lives in carstate instead
+  // (accFaulted on radar-came-back) plus the session manager's bounded re-silence.
   static const CanMsg MAZDA_LONG_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
