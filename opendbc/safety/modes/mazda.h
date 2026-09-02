@@ -84,6 +84,8 @@ static bool mazda_empty_radar_track_msg_valid(const CANPacket_t *msg) {
             (msg->data[2] == 0xfeU) && (msg->data[3] == 0x7fU) &&
             (msg->data[4] == 0xfbU) && (msg->data[5] == 0xffU) &&
             (msg->data[6] == 0x3fU) && ((msg->data[7] & 0xf0U) == 0xc0U);
+  } else {
+    // not a radar track address: valid stays false
   }
 
   return valid;
@@ -96,8 +98,8 @@ static bool mazda_synthetic_lead_radar_track_msg_valid(const CANPacket_t *msg) {
   // match it exactly. A byte-exact check here silently dropped every real-lead frame and
   // starved the camera of the track (route 6bb2dc61c4: 982 asked, 0 transmitted).
   return (msg->addr == MAZDA_RADAR_TRACK_4) &&
-         ((msg->data[1] & 0x0fU) == 0x00U) && (msg->data[2] == 0x00U) &&
-         ((msg->data[4] & 0x1fU) == 0x1dU) && (msg->data[5] == 0xc0U) &&
+         ((msg->data[1] & 0x0fU) == 0x0eU) && (msg->data[2] == 0x00U) &&
+         ((msg->data[4] & 0x1fU) == 0x1cU) && (msg->data[5] == 0x00U) &&
          (msg->data[6] == 0x00U) && ((msg->data[7] & 0xf0U) == 0x00U);
 }
 
@@ -143,6 +145,8 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
         mazda_engage_btn_frames = MAZDA_ENGAGE_BTN_WINDOW;
       } else if (mazda_engage_btn_frames > 0U) {
         mazda_engage_btn_frames -= 1U;
+      } else {
+        // window already expired: nothing to decay
       }
     }
 
@@ -191,6 +195,17 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
   }
 }
 
+static bool mazda_is_lka_addr(int addr) {
+  return (((unsigned int)addr == MAZDA_LKAS) || ((unsigned int)addr == MAZDA_LKAS_HUD));
+}
+
+// One sender per LKAS address, at frame granularity: the camera owns them while openpilot
+// controls neither axis (stock lane keep and dash LDW stay live), openpilot once either
+// axis engages. Either axis, not lateral alone: the controller still sends idle 0x243.
+static bool mazda_openpilot_controlling(void) {
+  return controls_allowed || controls_allowed_lateral;
+}
+
 static bool mazda_tx_hook(const CANPacket_t *msg) {
   // Envelope sized for the CX-5 2022+ EPS, which the controller commands up to (max_torque 1200,
   // driver_torque_multiplier 15 vs upstream stock 800/1). SafetyModel.mazda is per-brand and can't
@@ -228,6 +243,11 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  // keep after the steer checks, which reset rate-limit state on every disengaged frame
+  if (main_bus && mazda_is_lka_addr(msg->addr) && !mazda_openpilot_controlling()) {
+    tx = false;
+  }
+
   if (mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
     // the stock patterns for a radar that is not controlling peg the command field high:
     // main-off standby (data[4]=0xc0, data[5]=0x00) and armed-idle (bit 47 set, and
@@ -242,8 +262,10 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
                          (msg->data[7] == ((0xffU - ((msg->data[0] + msg->data[1] + msg->data[2] + msg->data[3] +
                                                      msg->data[4] + msg->data[5] + msg->data[6]) & 0xffU)) & 0xffU));
 
-    // 13-bit ACCEL_CMD: data[2] low bits, data[3], data[4] high bits, offset 4096
-    int desired_accel = ((((int)msg->data[2] & 0x3) << 11) | (((int)msg->data[3]) << 3) | (((int)msg->data[4]) >> 5)) - 4096;
+    // 13-bit ACCEL_CMD: data[2] low bits, data[3], data[4] high bits, offset 4096.
+    // Assembled unsigned so every shift operand is an essential unsigned type (MISRA 10.1).
+    uint32_t accel_raw = (((uint32_t)msg->data[2] & 0x3U) << 11) | ((uint32_t)msg->data[3] << 3) | ((uint32_t)msg->data[4] >> 5);
+    int desired_accel = (int)accel_raw - 4096;
     if (!stock_standby && longitudinal_accel_checks(desired_accel, MAZDA_LONG_LIMITS)) {
       tx = false;
     }
@@ -306,6 +328,18 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
+static bool mazda_fwd_hook(int bus_num, int addr) {
+  bool block_msg = false;
+
+  if (bus_num == MAZDA_CAM) {
+    if (mazda_is_lka_addr(addr)) {
+      block_msg = mazda_openpilot_controlling();
+    }
+  }
+
+  return block_msg;
+}
+
 static safety_config mazda_init(uint16_t param) {
   mazda_engage_btn_frames = 0U;
   mazda_radar_mastered = false;
@@ -313,9 +347,9 @@ static safety_config mazda_init(uint16_t param) {
   mazda_radar_was_silenced = false;
 
   static const CanMsg MAZDA_TX_MSGS[] = {
-    {MAZDA_LKAS, 0, 8, .check_relay = true},
+    {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
-    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true},
+    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
   };
 
   // The replaced-radar addresses stay check_relay = false on purpose: that mechanism is for
@@ -325,9 +359,9 @@ static safety_config mazda_init(uint16_t param) {
   // relay check would fault every boot. The two-master guard lives in carstate instead
   // (accFaulted on radar-came-back) plus the session manager's bounded re-silence.
   static const CanMsg MAZDA_LONG_TX_MSGS[] = {
-    {MAZDA_LKAS, 0, 8, .check_relay = true},
+    {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
-    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true},
+    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
     {MAZDA_CRZ_INFO, 0, 8, .check_relay = false},
     {MAZDA_CRZ_CTRL, 0, 8, .check_relay = false},
     {MAZDA_RADAR_STATIC, 0, 8, .check_relay = false},
@@ -376,4 +410,5 @@ const safety_hooks mazda_hooks = {
   .init = mazda_init,
   .rx = mazda_rx_hook,
   .tx = mazda_tx_hook,
+  .fwd = mazda_fwd_hook,
 };
